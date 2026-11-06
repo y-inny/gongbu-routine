@@ -1,0 +1,28 @@
+const {test}=require('node:test');
+const assert=require('node:assert/strict');
+const fs=require('node:fs');
+const vm=require('node:vm');
+const html=fs.readFileSync(require('node:path').join(__dirname,'../index.html'),'utf8');
+const script=html.split('<script>')[1].split('</script>')[0];
+// Exercise production functions with UI/network initialization disabled.
+const boundary=script.lastIndexOf("normalizeStateTiming(state);restoreNavigation();");
+assert.ok(boundary>0);
+const sandbox={console,Date,Intl,Math,JSON,Map,Set,Number,String,Object,Array,FormData,localStorage:{getItem:()=>null,setItem:()=>{}},document:{addEventListener:()=>{},querySelector:()=>null},window:{addEventListener:()=>{}},setTimeout:()=>0,clearTimeout:()=>{},setInterval:()=>0,alert:()=>{},confirm:()=>true};
+vm.createContext(sandbox);
+vm.runInContext(script.slice(0,boundary)+`globalThis.api={schedule,normalizeDayTiming,normalizeStateTiming,updatePlanTiming,insertAtTime,makeEvents,saveDailySettings,settingsForDate,freshEvent,shiftFollowing, getState:()=>state,setState:s=>state=s};})();`,sandbox);
+const a=sandbox.api;
+const e=(id,start,duration,kind='study',extra=0)=>({id,name:id,start,duration,kind,extra,items:[],logs:[],done:false});
+const day=(events)=>({date:'2026-11-07',events});
+const times=d=>Array.from(d.events,e=>e.start);
+const roundTrip=d=>{const copy=JSON.parse(JSON.stringify(d));a.normalizeDayTiming(copy);assert.deepEqual(times(copy),times(d));assert.deepEqual(Array.from(a.schedule(copy),x=>x.startComputed),times(copy));return copy};
+test('legacy display offsets become stored times and remain stable across reloads',()=>{let d=day([e('study',565,120),e('break',625,15,'break'),e('next',640,30)]);a.normalizeDayTiming(d);assert.deepEqual(times(d),[565,685,700]);for(let i=0;i<10;i++)d=roundTrip(d)});
+test('next insertion keeps exact array position and cascades through sleep',()=>{const d=day([e('a',600,60),e('b',660,30),e('sleep',690,0,'sleep')]);a.normalizeDayTiming(d);d.events.splice(1,0,e('inserted',660,20));a.normalizeDayTiming(d);assert.deepEqual(times(d),[600,660,680,710]);roundTrip(d)});
+test('editing duration both extends and shortens the suffix',()=>{const d=day([e('a',600,60),e('b',660,30),e('sleep',690,0,'sleep')]);a.updatePlanTiming(d,d.events[0],600,90);assert.deepEqual(times(d),[600,690,720]);a.updatePlanTiming(d,d.events[0],600,30);assert.deepEqual(times(d),[600,630,660]);roundTrip(d)});
+test('explicit start takes precedence over an overlapping previous block',()=>{const d=day([e('a',600,60),e('b',660,30),e('c',690,20)]),b=d.events[1];a.updatePlanTiming(d,b,620,30);assert.equal(d.events[0].id,'b');assert.equal(b.start,620);assert.deepEqual(times(d),[620,650,710]);roundTrip(d)});
+test('wake is not silently put before an explicit first insertion',()=>{const d=day([e('custom',480,20),{...e('wake',480,30,'routine'),name:'기상 · 씻기'},e('b',510,20)]);a.normalizeDayTiming(d);assert.deepEqual(times(d),[480,500,530]);assert.equal(a.schedule(d)[0].id,'custom');roundTrip(d)});
+test('free time honors its edited duration; sleep follows the actual order',()=>{const d=day([e('a',1320,60),e('free',1380,90,'flex'),e('sleep',1380,0,'sleep')]);a.normalizeDayTiming(d);assert.deepEqual(times(d),[1320,1380,1470]);roundTrip(d);assert.equal(a.updatePlanTiming(d,d.events[2],1470,0),true)});
+test('changing overtime moves the suffix once and can be reduced',()=>{const d=day([e('a',600,60),e('b',660,30),e('sleep',690,0,'sleep')]);a.normalizeDayTiming(d);d.events[0].extra=20;a.normalizeDayTiming(d);assert.deepEqual(times(d),[600,680,710]);roundTrip(d);d.events[0].extra=5;a.normalizeDayTiming(d);assert.deepEqual(times(d),[600,665,695]);roundTrip(d)});
+test('skip and restore cascade without counting skipped duration',()=>{const d=day([e('a',600,60),e('b',660,30),e('c',690,20)]);a.normalizeDayTiming(d);d.events[1].skipped=true;a.shiftFollowing(d,1,-30);a.normalizeDayTiming(d);assert.deepEqual(times(d),[600,660,660]);d.events[1].skipped=false;a.shiftFollowing(d,1,30);a.normalizeDayTiming(d);assert.deepEqual(times(d),[600,660,690]);roundTrip(d)});
+test('default changes never rewrite manually edited existing dates',()=>{const state=a.getState(),original=JSON.stringify(state.days);a.saveDailySettings({...state.settings,wake:'11:00',lunch:'15:00',useDefault:false},'2026-11-07');assert.equal(JSON.stringify(state.days),original);assert.equal(a.makeEvents(a.settingsForDate('2026-11-08'),0).length,0);assert.ok(a.makeEvents({...a.settingsForDate('2026-11-08'),useDefault:true},0).length>0)});
+test('custom default template gets independent IDs and cleared completion',()=>{const cfg={useDefault:true,template:[{...e('old',600,45),done:true,actual:40,items:[{name:'복습',checked:true}],repeatRuleId:'old-rule'}]};const first=a.makeEvents(cfg,0),second=a.makeEvents(cfg,1);assert.notEqual(first[0].id,second[0].id);assert.equal(first[0].items[0].name,'복습');assert.equal(first[0].items[0].checked,false);assert.equal(first[0].done,false);assert.equal(first[0].actual,0);assert.equal(first[0].repeatRuleId,undefined)});
+test('time-based copies precede overlap and persist correctly',()=>{const d=day([e('a',600,60),e('b',660,30)]);a.insertAtTime(d,e('copy',630,15));assert.deepEqual(times(d),[630,645,705]);roundTrip(d)});
